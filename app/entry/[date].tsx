@@ -16,6 +16,7 @@ import * as ImagePicker from "expo-image-picker";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useEffect, useState } from "react";
 import {
+  ActivityIndicator,
   Alert,
   Image,
   ScrollView,
@@ -25,6 +26,22 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+
+function moodEmoji(mood: string): string {
+  const map: Record<string, string> = {
+    happy: "😊",
+    sad: "😢",
+    anxious: "😰",
+    calm: "😌",
+    excited: "🎉",
+    angry: "😠",
+    grateful: "🙏",
+    reflective: "🤔",
+    neutral: "😐",
+  };
+  return map[mood] ?? "📝";
+}
+
 export default function EntryScreen() {
   const { date } = useLocalSearchParams<{ date: string }>();
   const router = useRouter();
@@ -35,10 +52,10 @@ export default function EntryScreen() {
   const [existingEntryId, setExistingEntryId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [isEditing, setIsEditing] = useState(false);
+  const [mood, setMood] = useState<string | null>(null);
 
   const audioRecorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
   const recorderState = useAudioRecorderState(audioRecorder);
-
   const audioPlayer = useAudioPlayer(audioUri ?? undefined);
   const playerStatus = useAudioPlayerStatus(audioPlayer);
 
@@ -70,8 +87,7 @@ export default function EntryScreen() {
         setLoading(false);
       }
 
-      // Then try Supabase, to catch anything newer (e.g. edited on another device)
-      // Wrapped so a failure here (offline) doesn't break the screen, since local data already showed
+      // Then try Supabase, to catch anything newer
       try {
         const { data, error } = await supabase
           .from("entries")
@@ -88,8 +104,8 @@ export default function EntryScreen() {
           setImageUri(data.image_url ?? null);
           setAudioUri(data.audio_url ?? null);
           setIsEditing(false);
+          if (data.ai_mood) setMood(data.ai_mood);
 
-          // Keep local DB in sync with what Supabase actually has
           await upsertLocalEntry({
             id: data.id,
             user_id: userId,
@@ -124,13 +140,11 @@ export default function EntryScreen() {
       );
       return;
     }
-
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ["images"],
       quality: 0.7,
       allowsEditing: true,
     });
-
     if (!result.canceled) {
       setImageUri(result.assets[0].uri);
     }
@@ -147,12 +161,10 @@ export default function EntryScreen() {
         );
         return;
       }
-
       await setAudioModeAsync({
         playsInSilentMode: true,
         allowsRecording: true,
       });
-
       await audioRecorder.prepareToRecordAsync();
       audioRecorder.record();
     } catch {
@@ -183,25 +195,53 @@ export default function EntryScreen() {
     const file = new File(uri);
     const bytes = await file.bytes();
     const fileName = `${Date.now()}.${fileExt}`;
-
     const { data: userData } = await supabase.auth.getUser();
     const userId = userData.user?.id;
     const path = `${userId}/${fileName}`;
-
     const { error } = await supabase.storage.from(bucket).upload(path, bytes, {
       contentType: fileExt === "jpg" ? "image/jpeg" : "audio/m4a",
     });
-
     if (error) throw error;
-
     const { data, error: urlError } = await supabase.storage
       .from(bucket)
-      .createSignedUrl(path, 60 * 60 * 24 * 365); // 1 year
+      .createSignedUrl(path, 60 * 60 * 24 * 365);
     if (urlError) throw urlError;
     return data.signedUrl;
   };
 
   const isLocalUri = (uri: string | null) => !!uri && !uri.startsWith("http");
+
+  // --- MOOD ANALYSIS ---
+  const analyzeMood = async (caption: string, entryId: string) => {
+    try {
+      const { data: sessionData } = await supabase.auth.getSession();
+      const token = sessionData.session?.access_token;
+      if (!token || !caption.trim()) return;
+
+      const response = await fetch(
+        "https://cnhgenchxdmzomaaggec.supabase.co/functions/v1/analyze-mood",
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ caption }),
+        },
+      );
+
+      const result = await response.json();
+      if (result.mood) {
+        setMood(result.mood);
+        await supabase
+          .from("entries")
+          .update({ ai_mood: result.mood })
+          .eq("id", entryId);
+      }
+    } catch (err) {
+      console.log("Mood analysis failed (non-blocking):", err);
+    }
+  };
 
   // --- SAVE ---
   const handleSave = async () => {
@@ -219,7 +259,6 @@ export default function EntryScreen() {
       const userId = sessionData.session?.user?.id;
       if (!userId) throw new Error("Not logged in");
 
-      // Try the full online path first
       try {
         let imageUrl: string | null = imageUri;
         let audioUrl: string | null = audioUri;
@@ -282,15 +321,15 @@ export default function EntryScreen() {
         setAudioUri(audioUrl);
         setExistingEntryId(newId);
         setIsEditing(false);
+        if (caption.trim() && newId) {
+          analyzeMood(caption, newId as string);
+        }
       } catch (onlineErr) {
-        // Online path failed (likely offline) — fall back to local-only save
         console.log(
           "Online save failed, falling back to local-only save:",
           onlineErr,
         );
-
         const localId = existingEntryId ?? Crypto.randomUUID();
-
         await upsertLocalEntry({
           id: localId,
           user_id: userId,
@@ -302,10 +341,8 @@ export default function EntryScreen() {
           audio_remote_url: isLocalUri(audioUri) ? null : audioUri,
           sync_status: "pending",
         });
-
         setExistingEntryId(localId);
         setIsEditing(false);
-
         Alert.alert(
           "Saved offline",
           "No internet connection right now — your entry is saved on this device and will sync automatically once you're back online.",
@@ -317,12 +354,27 @@ export default function EntryScreen() {
       setSaving(false);
     }
   };
-  // --- VIEW MODE: Instagram-style read-only post ---
+
+  if (loading) {
+    return (
+      <View style={styles.loadingContainer}>
+        <ActivityIndicator size="large" color="#1D3D47" />
+      </View>
+    );
+  }
+
+  // --- VIEW MODE ---
   if (!isEditing) {
     return (
       <View style={styles.viewContainer}>
         <ScrollView contentContainerStyle={styles.viewContent}>
           <Text style={styles.dateLabel}>{date}</Text>
+
+          {mood && (
+            <Text style={styles.moodTag}>
+              {moodEmoji(mood)} {mood}
+            </Text>
+          )}
 
           {imageUri && (
             <Image source={{ uri: imageUri }} style={styles.postImage} />
@@ -357,7 +409,7 @@ export default function EntryScreen() {
     );
   }
 
-  // --- EDIT MODE: form with pickers ---
+  // --- EDIT MODE ---
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
       <Text style={styles.dateLabel}>{date}</Text>
@@ -451,15 +503,9 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#fff" },
   content: { padding: 20, paddingBottom: 60 },
   loadingContainer: { flex: 1, justifyContent: "center", alignItems: "center" },
-
-  // View mode styles
   viewContainer: { flex: 1, backgroundColor: "#fff" },
   viewContent: { paddingBottom: 100 },
-  postImage: {
-    width: "100%",
-    aspectRatio: 1,
-    backgroundColor: "#f2f2f2",
-  },
+  postImage: { width: "100%", aspectRatio: 1, backgroundColor: "#f2f2f2" },
   audioPlayerBar: {
     flexDirection: "row",
     alignItems: "center",
@@ -470,17 +516,20 @@ const styles = StyleSheet.create({
     backgroundColor: "#f2f2f2",
     gap: 10,
   },
-  audioPlayerText: {
-    fontSize: 15,
-    color: "#1D3D47",
-    fontWeight: "500",
-  },
+  audioPlayerText: { fontSize: 15, color: "#1D3D47", fontWeight: "500" },
   postCaption: {
     fontSize: 16,
     lineHeight: 22,
     color: "#222",
     paddingHorizontal: 20,
     marginTop: 16,
+  },
+  moodTag: {
+    fontSize: 14,
+    color: "#1D3D47",
+    paddingHorizontal: 20,
+    paddingTop: 8,
+    fontWeight: "500",
   },
   editFab: {
     position: "absolute",
@@ -498,8 +547,6 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.25,
     shadowRadius: 4,
   },
-
-  // Edit mode styles
   dateLabel: {
     fontSize: 18,
     fontWeight: "600",
@@ -561,10 +608,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   saveButtonText: { color: "#fff", fontSize: 16, fontWeight: "600" },
-  cancelButton: {
-    marginTop: 12,
-    padding: 14,
-    alignItems: "center",
-  },
+  cancelButton: { marginTop: 12, padding: 14, alignItems: "center" },
   cancelButtonText: { color: "#999", fontSize: 15 },
 });
